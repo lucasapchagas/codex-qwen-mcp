@@ -41,6 +41,8 @@ Qwen thinking is enabled by default. The bridge sends:
 
 When Qwen returns hidden reasoning as `reasoning_content`, the MCP bridge strips it from the normal tool response and returns only the final `content`. This preserves Qwen's reasoning quality without filling Codex's context with the hidden chain of thought. Thinking still costs local generation time and completion tokens, so the bridge gives thinking-enabled calls a larger token budget.
 
+Usage metadata is hidden by default, so normal tool output is just Qwen's final answer. Set `QWEN_INCLUDE_USAGE=true` only when debugging token counts or finish reasons.
+
 If Qwen spends the whole completion budget thinking and never emits final `content`, the bridge returns a short diagnostic instead of exposing hidden reasoning. Increase `max_tokens`, raise `QWEN_THINKING_MIN_MAX_TOKENS`, narrow the task, or disable thinking for that specific call.
 
 ## Tools
@@ -143,6 +145,7 @@ args = ['D:\Repos\codex-qwen-mcp\src\index.mjs']
 [mcp_servers."qwen-local".env]
 QWEN_BASE_URL = "http://localhost:8081"
 QWEN_ENABLE_THINKING = "true"
+QWEN_INCLUDE_USAGE = "false"
 QWEN_THINKING_MIN_MAX_TOKENS = "8192"
 QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
@@ -162,6 +165,7 @@ args = ['/path/to/codex-qwen-mcp/src/index.mjs']
 [mcp_servers."qwen-local".env]
 QWEN_BASE_URL = "http://localhost:8081"
 QWEN_ENABLE_THINKING = "true"
+QWEN_INCLUDE_USAGE = "false"
 QWEN_THINKING_MIN_MAX_TOKENS = "8192"
 QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
@@ -180,6 +184,7 @@ Restart or reload Codex after changing MCP config.
 | `QWEN_BASE_URL` | `http://localhost:8081` | Base URL for the local Qwen server. |
 | `QWEN_MODEL` | First model from `/v1/models` | Optional explicit model id. |
 | `QWEN_ENABLE_THINKING` | `true` | Enables Qwen thinking by default. |
+| `QWEN_INCLUDE_USAGE` | `false` | Appends token usage and finish reason to tool output when enabled. |
 | `QWEN_THINKING_MIN_MAX_TOKENS` | `8192` | Minimum completion budget when thinking is enabled. |
 | `QWEN_MAX_TOKENS` | `4096` | Default completion budget before thinking minimum is applied. |
 | `QWEN_TIMEOUT_MS` | `120000` | HTTP timeout for Qwen calls. |

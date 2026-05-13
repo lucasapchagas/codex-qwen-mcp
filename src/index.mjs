@@ -18,6 +18,7 @@ const DEFAULT_TIMEOUT_MS = parseIntEnv("QWEN_TIMEOUT_MS", 120000);
 const DEFAULT_ASYNC_TIMEOUT_MS = parseIntEnv("QWEN_ASYNC_TIMEOUT_MS", 15 * 60 * 1000);
 const DEFAULT_MAX_TOKENS = parseIntEnv("QWEN_MAX_TOKENS", 4096);
 const DEFAULT_ENABLE_THINKING = parseBoolEnv("QWEN_ENABLE_THINKING", true);
+const DEFAULT_INCLUDE_USAGE = parseBoolEnv("QWEN_INCLUDE_USAGE", false);
 const THINKING_MIN_MAX_TOKENS = parseIntEnv("QWEN_THINKING_MIN_MAX_TOKENS", 8192);
 const DEFAULT_TEMPERATURE = parseFloatEnv("QWEN_TEMPERATURE", 0.2);
 const DEFAULT_MAX_TOTAL_BYTES = parseIntEnv("QWEN_MAX_TOTAL_BYTES", 1_200_000);
@@ -619,7 +620,7 @@ function extractMessageText(completion, includeReasoning) {
   const content = normalizeContent(message.content);
   const reasoning = normalizeContent(message.reasoning_content);
   const finish = completion?.choices?.[0]?.finish_reason;
-  const usage = completion?.usage
+  const usage = DEFAULT_INCLUDE_USAGE && completion?.usage
     ? `\n\n[usage: prompt=${completion.usage.prompt_tokens ?? "?"}, completion=${completion.usage.completion_tokens ?? "?"}, finish=${finish ?? "?"}]`
     : "";
 
