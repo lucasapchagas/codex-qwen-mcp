@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
 import { PDFParse } from "pdf-parse";
+import sharp from "sharp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -22,8 +23,11 @@ const DEFAULT_TEMPERATURE = parseFloatEnv("QWEN_TEMPERATURE", 0.2);
 const DEFAULT_MAX_TOTAL_BYTES = parseIntEnv("QWEN_MAX_TOTAL_BYTES", 1_200_000);
 const DEFAULT_MAX_FILE_BYTES = parseIntEnv("QWEN_MAX_FILE_BYTES", 240_000);
 const DEFAULT_MAX_PDF_BYTES = parseIntEnv("QWEN_MAX_PDF_BYTES", 20_000_000);
+const DEFAULT_MAX_IMAGE_BYTES = parseIntEnv("QWEN_MAX_IMAGE_BYTES", 20_000_000);
+const DEFAULT_IMAGE_MAX_DIMENSION = parseIntEnv("QWEN_IMAGE_MAX_DIMENSION", 2048);
 const HARD_MAX_TOTAL_BYTES = parseIntEnv("QWEN_HARD_MAX_TOTAL_BYTES", 8_000_000);
 const HARD_MAX_PDF_BYTES = parseIntEnv("QWEN_HARD_MAX_PDF_BYTES", 100_000_000);
+const HARD_MAX_IMAGE_BYTES = parseIntEnv("QWEN_HARD_MAX_IMAGE_BYTES", 100_000_000);
 const JOB_TTL_MS = parseIntEnv("QWEN_JOB_TTL_MS", 60 * 60 * 1000);
 
 const jobs = new Map();
@@ -130,6 +134,47 @@ server.registerTool(
         enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
       });
       return textResult(extractMessageText(completion, false));
+    });
+  }
+);
+
+server.registerTool(
+  "qwen_image_chat",
+  {
+    description:
+      "Send a local image to Qwen for multimodal analysis. The MCP server reads the image path, converts formats such as WebP to PNG, optionally resizes large images, and sends only the normalized image to Qwen.",
+    inputSchema: z.object({
+      image_path: z.string().min(1),
+      prompt: z.string().min(1).default("Describe this image in detail."),
+      system: z.string().optional(),
+      cwd: z.string().optional(),
+      model: z.string().optional(),
+      temperature: z.number().min(0).max(2).optional(),
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      enable_thinking: z.boolean().optional(),
+      include_reasoning: z.boolean().optional(),
+      max_image_bytes: z.number().int().positive().max(HARD_MAX_IMAGE_BYTES).optional(),
+      max_dimension: z.number().int().positive().max(8192).optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const image = await normalizeImageForQwen(args.image_path, {
+        cwd: args.cwd,
+        maxImageBytes: args.max_image_bytes ?? DEFAULT_MAX_IMAGE_BYTES,
+        maxDimension: args.max_dimension ?? DEFAULT_IMAGE_MAX_DIMENSION
+      });
+      const completion = await chatCompletion({
+        messages: buildImageMessages(args.system, args.prompt, image.dataUrl),
+        model: args.model,
+        temperature: args.temperature,
+        maxTokens: args.max_tokens ?? 1024,
+        enableThinking: args.enable_thinking ?? false
+      });
+      const response = extractMessageText(completion, args.include_reasoning ?? false);
+      return textResult(
+        `${response}\n\n[image: ${image.relativePath || image.path}, original=${image.originalBytes} bytes ${image.originalFormat || "unknown"} ${image.originalWidth || "?"}x${image.originalHeight || "?"}, sent=PNG ${image.outputBytes} bytes ${image.outputWidth || "?"}x${image.outputHeight || "?"}]`
+      );
     });
   }
 );
@@ -482,6 +527,21 @@ function buildMessages(system, prompt) {
   return messages;
 }
 
+function buildImageMessages(system, prompt, dataUrl) {
+  const messages = [];
+  if (system) {
+    messages.push({ role: "system", content: system });
+  }
+  messages.push({
+    role: "user",
+    content: [
+      { type: "text", text: prompt },
+      { type: "image_url", image_url: { url: dataUrl } }
+    ]
+  });
+  return messages;
+}
+
 async function chatCompletion({
   messages,
   model,
@@ -713,6 +773,50 @@ async function extractPdfText(buffer, filePath, skipped) {
       await parser.destroy().catch(() => {});
     }
   }
+}
+
+async function normalizeImageForQwen(imagePath, { cwd, maxImageBytes, maxDimension }) {
+  const base = path.resolve(cwd ?? process.cwd());
+  const resolved = path.isAbsolute(imagePath)
+    ? path.resolve(imagePath)
+    : path.resolve(base, imagePath);
+  const stat = await fs.stat(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`${resolved} is not a file`);
+  }
+  if (stat.size > maxImageBytes) {
+    throw new Error(`${resolved} is ${stat.size} bytes, exceeding max_image_bytes ${maxImageBytes}`);
+  }
+
+  const input = await fs.readFile(resolved);
+  const pipeline = sharp(input, { failOn: "none" }).rotate();
+  const metadata = await pipeline.metadata();
+  const width = metadata.width ?? 0;
+  const height = metadata.height ?? 0;
+  const longest = Math.max(width, height);
+  if (longest > maxDimension) {
+    pipeline.resize({
+      width: width >= height ? maxDimension : undefined,
+      height: height > width ? maxDimension : undefined,
+      fit: "inside",
+      withoutEnlargement: true
+    });
+  }
+
+  const output = await pipeline.png().toBuffer();
+  const outputMeta = await sharp(output).metadata();
+  return {
+    path: resolved,
+    relativePath: path.relative(base, resolved),
+    originalBytes: stat.size,
+    outputBytes: output.length,
+    originalFormat: metadata.format,
+    originalWidth: width,
+    originalHeight: height,
+    outputWidth: outputMeta.width,
+    outputHeight: outputMeta.height,
+    dataUrl: `data:image/png;base64,${output.toString("base64")}`
+  };
 }
 
 async function expandPatterns(patterns, cwd) {

@@ -53,6 +53,10 @@ Checks whether the local Qwen server is online and reports model metadata.
 
 Asks Qwen a direct question. Use for secondary reasoning, planning, draft code, or alternative implementation ideas.
 
+### `qwen_image_chat`
+
+Sends a local image file to Qwen for multimodal analysis. The MCP server reads the file path, normalizes orientation, resizes large images, converts the image to PNG, and sends it as a data URL to Qwen. This supports formats such as WebP even when llama.cpp rejects the original image format.
+
 ### `qwen_context_digest`
 
 Compresses pasted/provided context into a task-focused digest.
@@ -138,6 +142,8 @@ QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
 QWEN_MAX_PDF_BYTES = "20000000"
+QWEN_MAX_IMAGE_BYTES = "20000000"
+QWEN_IMAGE_MAX_DIMENSION = "2048"
 ```
 
 On macOS/Linux:
@@ -155,6 +161,8 @@ QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
 QWEN_MAX_PDF_BYTES = "20000000"
+QWEN_MAX_IMAGE_BYTES = "20000000"
+QWEN_IMAGE_MAX_DIMENSION = "2048"
 ```
 
 Restart or reload Codex after changing MCP config.
@@ -173,8 +181,11 @@ Restart or reload Codex after changing MCP config.
 | `QWEN_MAX_TOTAL_BYTES` | `1200000` | Default max total bytes read by file digest calls. |
 | `QWEN_MAX_FILE_BYTES` | `240000` | Default max bytes per text file, or extracted text bytes per PDF, read by file digest calls. |
 | `QWEN_MAX_PDF_BYTES` | `20000000` | Default max raw PDF file size accepted for text extraction. |
+| `QWEN_MAX_IMAGE_BYTES` | `20000000` | Default max raw image file size accepted by image chat calls. |
+| `QWEN_IMAGE_MAX_DIMENSION` | `2048` | Max width or height sent to Qwen after image normalization. |
 | `QWEN_HARD_MAX_TOTAL_BYTES` | `8000000` | Hard cap for file digest input size. |
 | `QWEN_HARD_MAX_PDF_BYTES` | `100000000` | Hard cap for raw PDF file size accepted by tool input. |
+| `QWEN_HARD_MAX_IMAGE_BYTES` | `100000000` | Hard cap for raw image file size accepted by tool input. |
 | `QWEN_JOB_TTL_MS` | `3600000` | How long completed/failed background jobs stay in memory. |
 
 ## Async Digest Workflow
