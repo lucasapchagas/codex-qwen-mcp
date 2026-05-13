@@ -13,6 +13,7 @@ const DEFAULT_BASE_URL = "http://localhost:8081";
 const BASE_URL = normalizeBaseUrl(process.env.QWEN_BASE_URL ?? DEFAULT_BASE_URL);
 const DEFAULT_MODEL = process.env.QWEN_MODEL ?? "";
 const DEFAULT_TIMEOUT_MS = parseIntEnv("QWEN_TIMEOUT_MS", 120000);
+const DEFAULT_ASYNC_TIMEOUT_MS = parseIntEnv("QWEN_ASYNC_TIMEOUT_MS", 15 * 60 * 1000);
 const DEFAULT_MAX_TOKENS = parseIntEnv("QWEN_MAX_TOKENS", 4096);
 const DEFAULT_ENABLE_THINKING = parseBoolEnv("QWEN_ENABLE_THINKING", true);
 const THINKING_MIN_MAX_TOKENS = parseIntEnv("QWEN_THINKING_MIN_MAX_TOKENS", 8192);
@@ -144,7 +145,8 @@ server.registerTool(
       max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       enable_thinking: z.boolean().optional(),
-      max_tokens: z.number().int().positive().max(65536).optional()
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      timeout_ms: z.number().int().positive().max(60 * 60 * 1000).optional()
     })
   },
   async (args) => {
@@ -167,7 +169,8 @@ server.registerTool(
       max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       enable_thinking: z.boolean().optional(),
-      max_tokens: z.number().int().positive().max(65536).optional()
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      timeout_ms: z.number().int().positive().max(60 * 60 * 1000).optional()
     })
   },
   async (args) => {
@@ -180,7 +183,9 @@ server.registerTool(
     }
 
     const job = startJob("qwen_files_digest", summarizeFilesDigestArgs(args), async () => {
-      return qwenFilesDigestText(args);
+      return qwenFilesDigestText(args, {
+        timeoutMs: args.timeout_ms ?? DEFAULT_ASYNC_TIMEOUT_MS
+      });
     });
 
     return textResult(
@@ -422,7 +427,8 @@ function summarizeFilesDigestArgs(args) {
     max_total_bytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
     max_file_bytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES,
     enable_thinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING,
-    max_tokens: args.max_tokens ?? 3072
+    max_tokens: args.max_tokens ?? 3072,
+    timeout_ms: args.timeout_ms ?? DEFAULT_ASYNC_TIMEOUT_MS
   };
 }
 
@@ -476,7 +482,8 @@ async function chatCompletion({
   model,
   temperature = DEFAULT_TEMPERATURE,
   maxTokens = DEFAULT_MAX_TOKENS,
-  enableThinking = DEFAULT_ENABLE_THINKING
+  enableThinking = DEFAULT_ENABLE_THINKING,
+  timeoutMs = DEFAULT_TIMEOUT_MS
 }) {
   const status = await getStatus();
   const resolvedModel = (model ?? DEFAULT_MODEL) || status.default_model;
@@ -494,11 +501,11 @@ async function chatCompletion({
   return requestJson("/v1/chat/completions", {
     method: "POST",
     body,
-    timeoutMs: DEFAULT_TIMEOUT_MS
+    timeoutMs
   });
 }
 
-async function qwenFilesDigestText(args) {
+async function qwenFilesDigestText(args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const bundle = await readPathBundle(args.paths, {
     cwd: args.cwd,
     maxTotalBytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
@@ -514,7 +521,8 @@ async function qwenFilesDigestText(args) {
     messages: buildMessages(digestSystemPrompt(), prompt),
     maxTokens: args.max_tokens ?? 3072,
     temperature: 0.1,
-    enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+    enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING,
+    timeoutMs
   });
   return extractMessageText(completion, false);
 }

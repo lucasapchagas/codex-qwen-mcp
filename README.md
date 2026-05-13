@@ -27,6 +27,8 @@ Every Qwen tool first checks whether the local server is reachable. If Qwen is o
 
 Some MCP clients time out a single tool call after roughly 120 seconds. For slow large-context digests, use the async job workflow: start `qwen_files_digest_async`, poll `qwen_job_status`, then fetch the completed text with `qwen_job_result`.
 
+Async jobs use `QWEN_ASYNC_TIMEOUT_MS` instead of the normal `QWEN_TIMEOUT_MS`, so the MCP call can return immediately while the local Qwen HTTP request continues in the background.
+
 Qwen thinking is enabled by default. The bridge sends:
 
 ```json
@@ -130,6 +132,7 @@ args = ['D:\Repos\codex-qwen-mcp\src\index.mjs']
 QWEN_BASE_URL = "http://localhost:8081"
 QWEN_ENABLE_THINKING = "true"
 QWEN_THINKING_MIN_MAX_TOKENS = "8192"
+QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
 ```
@@ -145,6 +148,7 @@ args = ['/path/to/codex-qwen-mcp/src/index.mjs']
 QWEN_BASE_URL = "http://localhost:8081"
 QWEN_ENABLE_THINKING = "true"
 QWEN_THINKING_MIN_MAX_TOKENS = "8192"
+QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
 ```
@@ -161,6 +165,7 @@ Restart or reload Codex after changing MCP config.
 | `QWEN_THINKING_MIN_MAX_TOKENS` | `8192` | Minimum completion budget when thinking is enabled. |
 | `QWEN_MAX_TOKENS` | `4096` | Default completion budget before thinking minimum is applied. |
 | `QWEN_TIMEOUT_MS` | `120000` | HTTP timeout for Qwen calls. |
+| `QWEN_ASYNC_TIMEOUT_MS` | `900000` | HTTP timeout for background async Qwen jobs. |
 | `QWEN_MAX_TOTAL_BYTES` | `1200000` | Default max total bytes read by file digest calls. |
 | `QWEN_MAX_FILE_BYTES` | `240000` | Default max bytes per file read by file digest calls. |
 | `QWEN_HARD_MAX_TOTAL_BYTES` | `8000000` | Hard cap for file digest input size. |
@@ -174,6 +179,8 @@ For large jobs, avoid holding a single MCP call open:
 2. Keep the returned `job_id`.
 3. Poll `qwen_job_status` every 20-60 seconds.
 4. When the job is `completed`, call `qwen_job_result`.
+
+If a job still fails with `request timed out`, increase `QWEN_ASYNC_TIMEOUT_MS` or pass `timeout_ms` directly to `qwen_files_digest_async`.
 
 Background jobs live in the MCP server process memory. They are lost if Codex restarts the MCP server.
 
