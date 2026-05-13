@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
+import { PDFParse } from "pdf-parse";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -20,7 +21,9 @@ const THINKING_MIN_MAX_TOKENS = parseIntEnv("QWEN_THINKING_MIN_MAX_TOKENS", 8192
 const DEFAULT_TEMPERATURE = parseFloatEnv("QWEN_TEMPERATURE", 0.2);
 const DEFAULT_MAX_TOTAL_BYTES = parseIntEnv("QWEN_MAX_TOTAL_BYTES", 1_200_000);
 const DEFAULT_MAX_FILE_BYTES = parseIntEnv("QWEN_MAX_FILE_BYTES", 240_000);
+const DEFAULT_MAX_PDF_BYTES = parseIntEnv("QWEN_MAX_PDF_BYTES", 20_000_000);
 const HARD_MAX_TOTAL_BYTES = parseIntEnv("QWEN_HARD_MAX_TOTAL_BYTES", 8_000_000);
+const HARD_MAX_PDF_BYTES = parseIntEnv("QWEN_HARD_MAX_PDF_BYTES", 100_000_000);
 const JOB_TTL_MS = parseIntEnv("QWEN_JOB_TTL_MS", 60 * 60 * 1000);
 
 const jobs = new Map();
@@ -41,7 +44,6 @@ const IGNORE_GLOBS = [
   "**/*.gif",
   "**/*.webp",
   "**/*.ico",
-  "**/*.pdf",
   "**/*.zip",
   "**/*.7z",
   "**/*.gz",
@@ -144,6 +146,7 @@ server.registerTool(
       cwd: z.string().optional(),
       max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      max_pdf_bytes: z.number().int().positive().max(HARD_MAX_PDF_BYTES).optional(),
       enable_thinking: z.boolean().optional(),
       max_tokens: z.number().int().positive().max(65536).optional(),
       timeout_ms: z.number().int().positive().max(60 * 60 * 1000).optional()
@@ -168,6 +171,7 @@ server.registerTool(
       cwd: z.string().optional(),
       max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
       max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      max_pdf_bytes: z.number().int().positive().max(HARD_MAX_PDF_BYTES).optional(),
       enable_thinking: z.boolean().optional(),
       max_tokens: z.number().int().positive().max(65536).optional(),
       timeout_ms: z.number().int().positive().max(60 * 60 * 1000).optional()
@@ -426,6 +430,7 @@ function summarizeFilesDigestArgs(args) {
     focus: args.focus,
     max_total_bytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
     max_file_bytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES,
+    max_pdf_bytes: args.max_pdf_bytes ?? DEFAULT_MAX_PDF_BYTES,
     enable_thinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING,
     max_tokens: args.max_tokens ?? 3072,
     timeout_ms: args.timeout_ms ?? DEFAULT_ASYNC_TIMEOUT_MS
@@ -509,7 +514,8 @@ async function qwenFilesDigestText(args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}
   const bundle = await readPathBundle(args.paths, {
     cwd: args.cwd,
     maxTotalBytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
-    maxFileBytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES
+    maxFileBytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES,
+    maxPdfBytes: args.max_pdf_bytes ?? DEFAULT_MAX_PDF_BYTES
   });
 
   const prompt = digestPrompt(
@@ -608,7 +614,7 @@ function digestPrompt(task, focus, content) {
     .join("\n\n");
 }
 
-async function readPathBundle(patterns, { cwd, maxTotalBytes, maxFileBytes }) {
+async function readPathBundle(patterns, { cwd, maxTotalBytes, maxFileBytes, maxPdfBytes }) {
   const base = path.resolve(cwd ?? process.cwd());
   const resolved = await expandPatterns(patterns, base);
   let totalBytes = 0;
@@ -627,19 +633,45 @@ async function readPathBundle(patterns, { cwd, maxTotalBytes, maxFileBytes }) {
       skipped.push(`${filePath}: not a file`);
       continue;
     }
-    if (stat.size > maxFileBytes) {
+    const isPdf = filePath.toLowerCase().endsWith(".pdf");
+    if (!isPdf && stat.size > maxFileBytes) {
       skipped.push(`${filePath}: ${stat.size} bytes exceeds max_file_bytes ${maxFileBytes}`);
       continue;
     }
-    if (totalBytes + stat.size > maxTotalBytes) {
-      skipped.push(`${filePath}: skipped because max_total_bytes ${maxTotalBytes} would be exceeded`);
+    if (isPdf && stat.size > maxPdfBytes) {
+      skipped.push(`${filePath}: PDF size ${stat.size} bytes exceeds max_pdf_bytes ${maxPdfBytes}`);
       continue;
     }
+
     let buffer;
     try {
       buffer = await fs.readFile(filePath);
     } catch (error) {
       skipped.push(`${filePath}: read failed (${error.message})`);
+      continue;
+    }
+    if (isPdf) {
+      const extracted = await extractPdfText(buffer, filePath, skipped);
+      if (!extracted) {
+        continue;
+      }
+      const textBytes = Buffer.byteLength(extracted, "utf8");
+      if (textBytes > maxFileBytes) {
+        skipped.push(`${filePath}: extracted PDF text ${textBytes} bytes exceeds max_file_bytes ${maxFileBytes}`);
+        continue;
+      }
+      if (totalBytes + textBytes > maxTotalBytes) {
+        skipped.push(`${filePath}: skipped because extracted PDF text would exceed max_total_bytes ${maxTotalBytes}`);
+        continue;
+      }
+      totalBytes += textBytes;
+      const rel = path.relative(base, filePath) || path.basename(filePath);
+      parts.push(`\n\n--- FILE: ${rel} (${textBytes} extracted text bytes from ${buffer.length} PDF bytes) ---\n${extracted}`);
+      continue;
+    }
+
+    if (totalBytes + buffer.length > maxTotalBytes) {
+      skipped.push(`${filePath}: skipped because max_total_bytes ${maxTotalBytes} would be exceeded`);
       continue;
     }
     if (looksBinary(buffer)) {
@@ -660,6 +692,27 @@ async function readPathBundle(patterns, { cwd, maxTotalBytes, maxFileBytes }) {
     ].join("\n"),
     content: parts.join("")
   };
+}
+
+async function extractPdfText(buffer, filePath, skipped) {
+  let parser;
+  try {
+    parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    const text = (result.text ?? "").trim();
+    if (!text) {
+      skipped.push(`${filePath}: PDF text extraction returned no text; OCR may be required for scanned/image PDFs`);
+      return "";
+    }
+    return text;
+  } catch (error) {
+    skipped.push(`${filePath}: PDF text extraction failed (${error.message})`);
+    return "";
+  } finally {
+    if (parser) {
+      await parser.destroy().catch(() => {});
+    }
+  }
 }
 
 async function expandPatterns(patterns, cwd) {

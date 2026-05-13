@@ -65,6 +65,8 @@ Reads local files or globs inside the MCP process and asks Qwen to summarize the
 
 Use this only for small or narrowed digests that should finish inside the MCP client's tool-call timeout.
 
+Text-based PDFs are supported: the bridge extracts embedded PDF text before sending context to Qwen. Scanned/image-only PDFs still need OCR and will be reported as having no extractable text.
+
 ### `qwen_files_digest_async`
 
 Starts a file/glob digest as a background job and returns a `job_id` immediately. Use this for real-world repository scans, long logs, or thinking-enabled digests that may take more than 120 seconds.
@@ -135,6 +137,7 @@ QWEN_THINKING_MIN_MAX_TOKENS = "8192"
 QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
+QWEN_MAX_PDF_BYTES = "20000000"
 ```
 
 On macOS/Linux:
@@ -151,6 +154,7 @@ QWEN_THINKING_MIN_MAX_TOKENS = "8192"
 QWEN_ASYNC_TIMEOUT_MS = "900000"
 QWEN_MAX_TOTAL_BYTES = "1200000"
 QWEN_MAX_FILE_BYTES = "240000"
+QWEN_MAX_PDF_BYTES = "20000000"
 ```
 
 Restart or reload Codex after changing MCP config.
@@ -167,8 +171,10 @@ Restart or reload Codex after changing MCP config.
 | `QWEN_TIMEOUT_MS` | `120000` | HTTP timeout for Qwen calls. |
 | `QWEN_ASYNC_TIMEOUT_MS` | `900000` | HTTP timeout for background async Qwen jobs. |
 | `QWEN_MAX_TOTAL_BYTES` | `1200000` | Default max total bytes read by file digest calls. |
-| `QWEN_MAX_FILE_BYTES` | `240000` | Default max bytes per file read by file digest calls. |
+| `QWEN_MAX_FILE_BYTES` | `240000` | Default max bytes per text file, or extracted text bytes per PDF, read by file digest calls. |
+| `QWEN_MAX_PDF_BYTES` | `20000000` | Default max raw PDF file size accepted for text extraction. |
 | `QWEN_HARD_MAX_TOTAL_BYTES` | `8000000` | Hard cap for file digest input size. |
+| `QWEN_HARD_MAX_PDF_BYTES` | `100000000` | Hard cap for raw PDF file size accepted by tool input. |
 | `QWEN_JOB_TTL_MS` | `3600000` | How long completed/failed background jobs stay in memory. |
 
 ## Async Digest Workflow
