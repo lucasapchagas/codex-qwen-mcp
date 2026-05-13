@@ -175,10 +175,14 @@ Restart or reload Codex after changing MCP config.
 
 For large jobs, avoid holding a single MCP call open:
 
-1. Call `qwen_files_digest_async`.
-2. Keep the returned `job_id`.
-3. Poll `qwen_job_status` every 20-60 seconds.
-4. When the job is `completed`, call `qwen_job_result`.
+1. Discover paths without reading target file contents. Good examples: `rg --files`, `git diff --name-only`, directory listings, or known paths from the user.
+2. Call `qwen_files_digest_async` with paths/globs, `cwd`, `task`, and optional `focus`.
+3. Keep the returned `job_id`.
+4. Poll `qwen_job_status` every 20-60 seconds.
+5. When the job is `completed`, call `qwen_job_result`.
+6. Use the digest as a map, then inspect only the specific source sections needed to verify claims and implement changes.
+
+Avoid pre-reading target file contents with `cat`, `Get-Content`, `rg` content searches, `sed`, `nl`, or similar tools when the goal is context offload. If Codex reads the files first, the MCP bridge cannot undo that context cost.
 
 If a job still fails with `request timed out`, increase `QWEN_ASYNC_TIMEOUT_MS` or pass `timeout_ms` directly to `qwen_files_digest_async`.
 
@@ -191,7 +195,7 @@ Add this to your personal Codex instructions if you want Codex to proactively us
 ```markdown
 When a coding or agentic task has broad context, many files, long logs, draft-code generation, or a useful second-review pass, check the `qwen-local` MCP server with `qwen_status`. Use it when online; skip it without blocking when offline.
 
-Prefer `qwen_files_digest_async` for large file sets so Codex does not need to load all file contents into its own context or hold a single MCP call open past the client timeout. Use synchronous `qwen_files_digest` only for small narrowed inputs. Use `qwen_chat`, `qwen_code_review`, and `qwen_refine_code` for secondary planning, independent review, and Qwen-to-Codex-to-Qwen refinement. Treat Qwen output as advisory and verify important claims in source files before editing or reporting.
+Prefer `qwen_files_digest_async` for large file sets so Codex does not need to load all file contents into its own context or hold a single MCP call open past the client timeout. For first-pass context offload, do not read target file contents before calling Qwen; use path-only discovery and pass paths/globs directly. Use synchronous `qwen_files_digest` only for small narrowed inputs. Use `qwen_chat`, `qwen_code_review`, and `qwen_refine_code` for secondary planning, independent review, and Qwen-to-Codex-to-Qwen refinement. Treat Qwen output as advisory and verify important claims in source files before editing or reporting.
 ```
 
 ## Development
