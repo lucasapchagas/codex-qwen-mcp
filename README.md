@@ -53,6 +53,8 @@ Checks whether the local Qwen server is online and reports model metadata.
 
 Asks Qwen a direct question. Use for secondary reasoning, planning, draft code, or alternative implementation ideas.
 
+Thinking is always enabled for this tool and cannot be disabled by tool arguments. Hidden reasoning is stripped from MCP output.
+
 ### `qwen_image_chat`
 
 Sends a local image file to Qwen for multimodal analysis. The MCP server reads the file path, normalizes orientation, resizes large images, converts the image to PNG, and sends it as a data URL to Qwen. This supports formats such as WebP even when llama.cpp rejects the original image format.
@@ -87,9 +89,13 @@ Fetches the final text from a completed background job. Pass `clear: true` when 
 
 Asks Qwen for an independent code review of code, diffs, or focused file bundles.
 
+Thinking is always enabled for this tool and cannot be disabled by tool arguments. Hidden reasoning is stripped from MCP output.
+
 ### `qwen_refine_code`
 
 Sends Qwen original code plus Codex feedback and asks it to refine the implementation.
+
+Thinking is always enabled for this tool and cannot be disabled by tool arguments. Hidden reasoning is stripped from MCP output.
 
 ## Requirements
 

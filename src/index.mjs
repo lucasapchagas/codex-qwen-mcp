@@ -92,9 +92,7 @@ server.registerTool(
       system: z.string().optional(),
       model: z.string().optional(),
       temperature: z.number().min(0).max(2).optional(),
-      max_tokens: z.number().int().positive().max(65536).optional(),
-      enable_thinking: z.boolean().optional(),
-      include_reasoning: z.boolean().optional()
+      max_tokens: z.number().int().positive().max(65536).optional()
     })
   },
   async (args) => {
@@ -104,9 +102,9 @@ server.registerTool(
         model: args.model,
         temperature: args.temperature,
         maxTokens: args.max_tokens,
-      enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+        enableThinking: true
       });
-      return textResult(extractMessageText(completion, args.include_reasoning ?? false));
+      return textResult(extractMessageText(completion, false));
     });
   }
 );
@@ -315,8 +313,7 @@ server.registerTool(
     inputSchema: z.object({
       code_or_diff: z.string().min(1),
       review_goal: z.string().default("Find correctness bugs, regressions, security risks, and missing tests."),
-      max_tokens: z.number().int().positive().max(65536).optional(),
-      enable_thinking: z.boolean().optional()
+      max_tokens: z.number().int().positive().max(65536).optional()
     })
   },
   async (args) => {
@@ -328,7 +325,7 @@ server.registerTool(
         ),
         maxTokens: args.max_tokens ?? 4096,
         temperature: 0.1,
-        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+        enableThinking: true
       });
       return textResult(extractMessageText(completion, false));
     });
@@ -344,8 +341,7 @@ server.registerTool(
       original_code: z.string().min(1),
       feedback: z.string().min(1),
       constraints: z.string().optional(),
-      max_tokens: z.number().int().positive().max(65536).optional(),
-      enable_thinking: z.boolean().optional()
+      max_tokens: z.number().int().positive().max(65536).optional()
     })
   },
   async (args) => {
@@ -364,7 +360,7 @@ server.registerTool(
         messages: buildMessages("You are a careful coding agent that applies review feedback precisely.", prompt),
         maxTokens: args.max_tokens ?? 8192,
         temperature: 0.15,
-        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+        enableThinking: true
       });
       return textResult(extractMessageText(completion, false));
     });
@@ -634,7 +630,7 @@ function extractMessageText(completion, includeReasoning) {
     return `${content}${usage}`;
   }
   if (reasoning) {
-    return `(Qwen returned hidden reasoning but no final content before the token budget ended. Retry with larger max_tokens, a higher QWEN_THINKING_MIN_MAX_TOKENS, a narrower task, or enable_thinking=false for that call.)${usage}`;
+    return `(Qwen returned hidden reasoning but no final content before the token budget ended. Retry with larger max_tokens, a higher QWEN_THINKING_MIN_MAX_TOKENS, a narrower task, or use a tool/call mode that permits disabling thinking.)${usage}`;
   }
   return `(empty Qwen response)${usage}`;
 }
