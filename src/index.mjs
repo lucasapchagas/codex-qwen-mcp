@@ -1,0 +1,514 @@
+#!/usr/bin/env node
+
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import fg from "fast-glob";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+const DEFAULT_BASE_URL = "http://localhost:8081";
+const BASE_URL = normalizeBaseUrl(process.env.QWEN_BASE_URL ?? DEFAULT_BASE_URL);
+const DEFAULT_MODEL = process.env.QWEN_MODEL ?? "";
+const DEFAULT_TIMEOUT_MS = parseIntEnv("QWEN_TIMEOUT_MS", 120000);
+const DEFAULT_MAX_TOKENS = parseIntEnv("QWEN_MAX_TOKENS", 4096);
+const DEFAULT_ENABLE_THINKING = parseBoolEnv("QWEN_ENABLE_THINKING", true);
+const THINKING_MIN_MAX_TOKENS = parseIntEnv("QWEN_THINKING_MIN_MAX_TOKENS", 8192);
+const DEFAULT_TEMPERATURE = parseFloatEnv("QWEN_TEMPERATURE", 0.2);
+const DEFAULT_MAX_TOTAL_BYTES = parseIntEnv("QWEN_MAX_TOTAL_BYTES", 1_200_000);
+const DEFAULT_MAX_FILE_BYTES = parseIntEnv("QWEN_MAX_FILE_BYTES", 240_000);
+const HARD_MAX_TOTAL_BYTES = parseIntEnv("QWEN_HARD_MAX_TOTAL_BYTES", 8_000_000);
+
+const IGNORE_GLOBS = [
+  "**/.git/**",
+  "**/node_modules/**",
+  "**/.next/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/target/**",
+  "**/.venv/**",
+  "**/venv/**",
+  "**/__pycache__/**",
+  "**/*.png",
+  "**/*.jpg",
+  "**/*.jpeg",
+  "**/*.gif",
+  "**/*.webp",
+  "**/*.ico",
+  "**/*.pdf",
+  "**/*.zip",
+  "**/*.7z",
+  "**/*.gz",
+  "**/*.tar",
+  "**/*.exe",
+  "**/*.dll",
+  "**/*.bin",
+  "**/*.gguf"
+];
+
+const server = new McpServer(
+  {
+    name: "codex-qwen-local",
+    version: "0.1.0"
+  },
+  {
+    instructions:
+      "Use these tools only when the local Qwen llama.cpp server is available. Prefer file/path based digest tools for large context so the main model does not need to load full file contents."
+  }
+);
+
+server.registerTool(
+  "qwen_status",
+  {
+    description:
+      "Check whether the local Qwen llama.cpp server is online and list available models/context metadata.",
+    inputSchema: z.object({})
+  },
+  async () => {
+    const status = await getStatus();
+    return textResult(JSON.stringify(status, null, 2), !status.online);
+  }
+);
+
+server.registerTool(
+  "qwen_chat",
+  {
+    description:
+      "Ask local Qwen a direct question. Good for secondary reasoning, code generation drafts, and agentic planning when the server is online.",
+    inputSchema: z.object({
+      prompt: z.string().min(1),
+      system: z.string().optional(),
+      model: z.string().optional(),
+      temperature: z.number().min(0).max(2).optional(),
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      enable_thinking: z.boolean().optional(),
+      include_reasoning: z.boolean().optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const completion = await chatCompletion({
+        messages: buildMessages(args.system, args.prompt),
+        model: args.model,
+        temperature: args.temperature,
+        maxTokens: args.max_tokens,
+      enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+      });
+      return textResult(extractMessageText(completion, args.include_reasoning ?? false));
+    });
+  }
+);
+
+server.registerTool(
+  "qwen_context_digest",
+  {
+    description:
+      "Compress pasted or provided long context into a structured digest for Codex. Prefer qwen_files_digest when the context exists in files.",
+    inputSchema: z.object({
+      content: z.string().min(1),
+      task: z.string().min(1),
+      focus: z.string().optional(),
+      enable_thinking: z.boolean().optional(),
+      max_tokens: z.number().int().positive().max(65536).optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const prompt = digestPrompt(args.task, args.focus, args.content);
+      const completion = await chatCompletion({
+        messages: buildMessages(digestSystemPrompt(), prompt),
+        maxTokens: args.max_tokens ?? 2048,
+        temperature: 0.1,
+        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+      });
+      return textResult(extractMessageText(completion, false));
+    });
+  }
+);
+
+server.registerTool(
+  "qwen_files_digest",
+  {
+    description:
+      "Read local files or globs inside the MCP process and ask Qwen to produce a compact, task-focused digest. Use this to offload large codebase context without first loading file bodies into Codex.",
+    inputSchema: z.object({
+      paths: z.array(z.string().min(1)).min(1),
+      task: z.string().min(1),
+      focus: z.string().optional(),
+      cwd: z.string().optional(),
+      max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      enable_thinking: z.boolean().optional(),
+      max_tokens: z.number().int().positive().max(65536).optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const bundle = await readPathBundle(args.paths, {
+        cwd: args.cwd,
+        maxTotalBytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
+        maxFileBytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES
+      });
+
+      const prompt = digestPrompt(
+        args.task,
+        args.focus,
+        `${bundle.summary}\n\n${bundle.content}`
+      );
+      const completion = await chatCompletion({
+        messages: buildMessages(digestSystemPrompt(), prompt),
+        maxTokens: args.max_tokens ?? 3072,
+        temperature: 0.1,
+        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+      });
+      return textResult(extractMessageText(completion, false));
+    });
+  }
+);
+
+server.registerTool(
+  "qwen_code_review",
+  {
+    description:
+      "Ask Qwen for an independent code review of code, diffs, or file bundles. Codex should audit the result before trusting it.",
+    inputSchema: z.object({
+      code_or_diff: z.string().min(1),
+      review_goal: z.string().default("Find correctness bugs, regressions, security risks, and missing tests."),
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      enable_thinking: z.boolean().optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const completion = await chatCompletion({
+        messages: buildMessages(
+          "You are an independent senior code reviewer. Prioritize concrete bugs with file/line references when possible. Do not praise. If no serious issue is found, say so and list residual risks.",
+          `Review goal: ${args.review_goal}\n\nCode or diff:\n${args.code_or_diff}`
+        ),
+        maxTokens: args.max_tokens ?? 4096,
+        temperature: 0.1,
+        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+      });
+      return textResult(extractMessageText(completion, false));
+    });
+  }
+);
+
+server.registerTool(
+  "qwen_refine_code",
+  {
+    description:
+      "Ask Qwen to refine previously generated code using Codex/GPT feedback. Useful for the Qwen -> Codex audit -> Qwen refine ping-pong workflow.",
+    inputSchema: z.object({
+      original_code: z.string().min(1),
+      feedback: z.string().min(1),
+      constraints: z.string().optional(),
+      max_tokens: z.number().int().positive().max(65536).optional(),
+      enable_thinking: z.boolean().optional()
+    })
+  },
+  async (args) => {
+    return guardedQwenCall(async () => {
+      const prompt = [
+        "Revise the code according to the feedback.",
+        args.constraints ? `Constraints:\n${args.constraints}` : "",
+        `Feedback:\n${args.feedback}`,
+        `Original code:\n${args.original_code}`,
+        "Return the refined code first, then a short changelog."
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      const completion = await chatCompletion({
+        messages: buildMessages("You are a careful coding agent that applies review feedback precisely.", prompt),
+        maxTokens: args.max_tokens ?? 8192,
+        temperature: 0.15,
+        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+      });
+      return textResult(extractMessageText(completion, false));
+    });
+  }
+);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`codex-qwen-local MCP server running on stdio; Qwen base URL: ${BASE_URL}`);
+}
+
+main().catch((error) => {
+  console.error("Fatal MCP server error:", error);
+  process.exit(1);
+});
+
+function normalizeBaseUrl(value) {
+  return value.replace(/\/+$/, "");
+}
+
+function parseIntEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseFloatEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseBoolEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value) return fallback;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
+function textResult(text, isError = false) {
+  return {
+    isError,
+    content: [{ type: "text", text: text || "(empty response)" }]
+  };
+}
+
+async function guardedQwenCall(fn) {
+  const status = await getStatus();
+  if (!status.online) {
+    return textResult(
+      `Qwen server is offline or unreachable at ${BASE_URL}. Details: ${status.error}`,
+      true
+    );
+  }
+  try {
+    return await fn();
+  } catch (error) {
+    return textResult(`Qwen call failed: ${error.message}`, true);
+  }
+}
+
+async function getStatus() {
+  try {
+    const data = await requestJson("/v1/models", { method: "GET", timeoutMs: 5000 });
+    const models = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
+    return {
+      online: true,
+      base_url: BASE_URL,
+      default_model: DEFAULT_MODEL || models[0]?.id || models[0]?.model || models[0]?.name || "",
+      models: models.map((model) => ({
+        id: model.id ?? model.model ?? model.name ?? "",
+        context_train_tokens: model.meta?.n_ctx_train,
+        parameters: model.meta?.n_params,
+        size_bytes: model.meta?.size,
+        capabilities: model.capabilities
+      }))
+    };
+  } catch (error) {
+    return { online: false, base_url: BASE_URL, error: error.message };
+  }
+}
+
+function buildMessages(system, prompt) {
+  const messages = [];
+  if (system) {
+    messages.push({ role: "system", content: system });
+  }
+  messages.push({ role: "user", content: prompt });
+  return messages;
+}
+
+async function chatCompletion({
+  messages,
+  model,
+  temperature = DEFAULT_TEMPERATURE,
+  maxTokens = DEFAULT_MAX_TOKENS,
+  enableThinking = DEFAULT_ENABLE_THINKING
+}) {
+  const status = await getStatus();
+  const resolvedModel = (model ?? DEFAULT_MODEL) || status.default_model;
+  const body = {
+    messages,
+    temperature,
+    max_tokens: enableThinking ? Math.max(maxTokens, THINKING_MIN_MAX_TOKENS) : maxTokens,
+    chat_template_kwargs: {
+      enable_thinking: enableThinking
+    }
+  };
+  if (resolvedModel) {
+    body.model = resolvedModel;
+  }
+  return requestJson("/v1/chat/completions", {
+    method: "POST",
+    body,
+    timeoutMs: DEFAULT_TIMEOUT_MS
+  });
+}
+
+async function requestJson(endpoint, { method, body, timeoutMs }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${BASE_URL}${endpoint}`, {
+      method,
+      headers: body ? { "content-type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 1000)}`);
+    }
+    return text ? JSON.parse(text) : {};
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractMessageText(completion, includeReasoning) {
+  const message = completion?.choices?.[0]?.message ?? {};
+  const content = normalizeContent(message.content);
+  const reasoning = normalizeContent(message.reasoning_content);
+  const finish = completion?.choices?.[0]?.finish_reason;
+  const usage = completion?.usage
+    ? `\n\n[usage: prompt=${completion.usage.prompt_tokens ?? "?"}, completion=${completion.usage.completion_tokens ?? "?"}, finish=${finish ?? "?"}]`
+    : "";
+
+  if (includeReasoning && reasoning) {
+    return `${content || "(no final content)"}\n\n[reasoning]\n${reasoning}${usage}`;
+  }
+  if (content) {
+    return `${content}${usage}`;
+  }
+  if (reasoning) {
+    return `(Qwen returned reasoning_content but no final content. Try again with more max_tokens or enable_thinking=false.)\n\n${reasoning.slice(0, 4000)}${usage}`;
+  }
+  return `(empty Qwen response)${usage}`;
+}
+
+function normalizeContent(content) {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (typeof part === "string" ? part : part?.text ?? ""))
+      .join("")
+      .trim();
+  }
+  return "";
+}
+
+function digestSystemPrompt() {
+  return [
+    "You compress large technical context for another coding agent.",
+    "Return a dense, accurate digest with these sections:",
+    "1. Task-relevant facts",
+    "2. Architecture and control flow",
+    "3. APIs, types, files, and symbols to preserve",
+    "4. Risks, edge cases, and likely bugs",
+    "5. Recommended next actions",
+    "Keep quotations short. Prefer concrete filenames, functions, invariants, and decisions over broad summary."
+  ].join("\n");
+}
+
+function digestPrompt(task, focus, content) {
+  return [
+    `Task: ${task}`,
+    focus ? `Focus: ${focus}` : "",
+    "Context follows. Digest it for a coding agent that cannot keep all of it in its own context window.",
+    content
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function readPathBundle(patterns, { cwd, maxTotalBytes, maxFileBytes }) {
+  const base = path.resolve(cwd ?? process.cwd());
+  const resolved = await expandPatterns(patterns, base);
+  let totalBytes = 0;
+  const parts = [];
+  const skipped = [];
+
+  for (const filePath of resolved) {
+    let stat;
+    try {
+      stat = await fs.stat(filePath);
+    } catch (error) {
+      skipped.push(`${filePath}: stat failed (${error.message})`);
+      continue;
+    }
+    if (!stat.isFile()) {
+      skipped.push(`${filePath}: not a file`);
+      continue;
+    }
+    if (stat.size > maxFileBytes) {
+      skipped.push(`${filePath}: ${stat.size} bytes exceeds max_file_bytes ${maxFileBytes}`);
+      continue;
+    }
+    if (totalBytes + stat.size > maxTotalBytes) {
+      skipped.push(`${filePath}: skipped because max_total_bytes ${maxTotalBytes} would be exceeded`);
+      continue;
+    }
+    let buffer;
+    try {
+      buffer = await fs.readFile(filePath);
+    } catch (error) {
+      skipped.push(`${filePath}: read failed (${error.message})`);
+      continue;
+    }
+    if (looksBinary(buffer)) {
+      skipped.push(`${filePath}: binary-looking content`);
+      continue;
+    }
+    totalBytes += buffer.length;
+    const rel = path.relative(base, filePath) || path.basename(filePath);
+    parts.push(`\n\n--- FILE: ${rel} (${buffer.length} bytes) ---\n${buffer.toString("utf8")}`);
+  }
+
+  return {
+    summary: [
+      `Base directory: ${base}`,
+      `Files included: ${parts.length}`,
+      `Bytes included: ${totalBytes}`,
+      skipped.length ? `Skipped:\n${skipped.map((item) => `- ${item}`).join("\n")}` : "Skipped: none"
+    ].join("\n"),
+    content: parts.join("")
+  };
+}
+
+async function expandPatterns(patterns, cwd) {
+  const files = new Set();
+  for (const pattern of patterns) {
+    const normalizedPattern = pattern.replaceAll("\\", "/");
+    const hasMagic = fg.isDynamicPattern(normalizedPattern);
+    if (path.isAbsolute(pattern) && !hasMagic) {
+      files.add(path.resolve(pattern));
+      continue;
+    }
+    const matches = await fg(normalizedPattern, {
+      cwd,
+      absolute: true,
+      onlyFiles: true,
+      dot: true,
+      ignore: IGNORE_GLOBS,
+      unique: true
+    });
+    for (const match of matches) {
+      files.add(path.resolve(match));
+    }
+  }
+  return [...files].sort((a, b) => a.localeCompare(b));
+}
+
+function looksBinary(buffer) {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 8192));
+  if (sample.includes(0)) return true;
+  const text = sample.toString("utf8");
+  return text.includes("\uFFFD");
+}
+
+export const __dirname = path.dirname(fileURLToPath(import.meta.url));

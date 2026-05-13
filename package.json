@@ -1,0 +1,22 @@
+{
+  "name": "codex-qwen-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP bridge from Codex to a llama.cpp Qwen server.",
+  "bin": {
+    "codex-qwen-mcp": "./src/index.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/index.mjs",
+    "smoke": "node ./scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.23.0",
+    "fast-glob": "^3.3.3",
+    "zod": "^4.1.12"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
