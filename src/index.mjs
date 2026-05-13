@@ -2,6 +2,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import fg from "fast-glob";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -19,6 +20,9 @@ const DEFAULT_TEMPERATURE = parseFloatEnv("QWEN_TEMPERATURE", 0.2);
 const DEFAULT_MAX_TOTAL_BYTES = parseIntEnv("QWEN_MAX_TOTAL_BYTES", 1_200_000);
 const DEFAULT_MAX_FILE_BYTES = parseIntEnv("QWEN_MAX_FILE_BYTES", 240_000);
 const HARD_MAX_TOTAL_BYTES = parseIntEnv("QWEN_HARD_MAX_TOTAL_BYTES", 8_000_000);
+const JOB_TTL_MS = parseIntEnv("QWEN_JOB_TTL_MS", 60 * 60 * 1000);
+
+const jobs = new Map();
 
 const IGNORE_GLOBS = [
   "**/.git/**",
@@ -145,25 +149,107 @@ server.registerTool(
   },
   async (args) => {
     return guardedQwenCall(async () => {
-      const bundle = await readPathBundle(args.paths, {
-        cwd: args.cwd,
-        maxTotalBytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
-        maxFileBytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES
-      });
-
-      const prompt = digestPrompt(
-        args.task,
-        args.focus,
-        `${bundle.summary}\n\n${bundle.content}`
-      );
-      const completion = await chatCompletion({
-        messages: buildMessages(digestSystemPrompt(), prompt),
-        maxTokens: args.max_tokens ?? 3072,
-        temperature: 0.1,
-        enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
-      });
-      return textResult(extractMessageText(completion, false));
+      return textResult(await qwenFilesDigestText(args));
     });
+  }
+);
+
+server.registerTool(
+  "qwen_files_digest_async",
+  {
+    description:
+      "Start a long-running file/glob digest as a background job and return immediately. Use this instead of qwen_files_digest when Qwen may exceed the MCP client's tool-call timeout.",
+    inputSchema: z.object({
+      paths: z.array(z.string().min(1)).min(1),
+      task: z.string().min(1),
+      focus: z.string().optional(),
+      cwd: z.string().optional(),
+      max_total_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      max_file_bytes: z.number().int().positive().max(HARD_MAX_TOTAL_BYTES).optional(),
+      enable_thinking: z.boolean().optional(),
+      max_tokens: z.number().int().positive().max(65536).optional()
+    })
+  },
+  async (args) => {
+    const status = await getStatus();
+    if (!status.online) {
+      return textResult(
+        `Qwen server is offline or unreachable at ${BASE_URL}. Details: ${status.error}`,
+        true
+      );
+    }
+
+    const job = startJob("qwen_files_digest", summarizeFilesDigestArgs(args), async () => {
+      return qwenFilesDigestText(args);
+    });
+
+    return textResult(
+      JSON.stringify(
+        {
+          job_id: job.id,
+          status: job.status,
+          kind: job.kind,
+          started_at: job.started_at,
+          message:
+            "Digest job started. Poll qwen_job_status with this job_id, then call qwen_job_result when status is completed."
+        },
+        null,
+        2
+      )
+    );
+  }
+);
+
+server.registerTool(
+  "qwen_job_status",
+  {
+    description:
+      "Check the status of a background Qwen job started by qwen_files_digest_async.",
+    inputSchema: z.object({
+      job_id: z.string().min(1),
+      include_result: z.boolean().optional()
+    })
+  },
+  async ({ job_id, include_result = false }) => {
+    cleanupJobs();
+    const job = jobs.get(job_id);
+    if (!job) {
+      return textResult(`No Qwen job found for id: ${job_id}`, true);
+    }
+    return textResult(JSON.stringify(serializeJob(job, include_result), null, 2), job.status === "failed");
+  }
+);
+
+server.registerTool(
+  "qwen_job_result",
+  {
+    description:
+      "Fetch the final result for a completed Qwen background job.",
+    inputSchema: z.object({
+      job_id: z.string().min(1),
+      clear: z.boolean().optional()
+    })
+  },
+  async ({ job_id, clear = false }) => {
+    cleanupJobs();
+    const job = jobs.get(job_id);
+    if (!job) {
+      return textResult(`No Qwen job found for id: ${job_id}`, true);
+    }
+    if (job.status === "running") {
+      return textResult(
+        `Qwen job ${job_id} is still running. Started at ${job.started_at}. Poll qwen_job_status later.`,
+        true
+      );
+    }
+    if (job.status === "failed") {
+      return textResult(`Qwen job ${job_id} failed:\n${job.error}`, true);
+    }
+    const result = job.result ?? "(empty result)";
+    if (clear) {
+      jobs.delete(job_id);
+    }
+    return textResult(result);
   }
 );
 
@@ -273,6 +359,73 @@ function textResult(text, isError = false) {
   };
 }
 
+function startJob(kind, inputSummary, fn) {
+  cleanupJobs();
+  const now = new Date().toISOString();
+  const job = {
+    id: randomUUID(),
+    kind,
+    status: "running",
+    input_summary: inputSummary,
+    started_at: now,
+    updated_at: now,
+    result: undefined,
+    error: undefined
+  };
+  jobs.set(job.id, job);
+
+  Promise.resolve()
+    .then(fn)
+    .then((result) => {
+      job.status = "completed";
+      job.result = result;
+      job.updated_at = new Date().toISOString();
+    })
+    .catch((error) => {
+      job.status = "failed";
+      job.error = error?.stack || error?.message || String(error);
+      job.updated_at = new Date().toISOString();
+    });
+
+  return job;
+}
+
+function cleanupJobs() {
+  const cutoff = Date.now() - JOB_TTL_MS;
+  for (const [id, job] of jobs) {
+    const updatedAt = Date.parse(job.updated_at);
+    if (Number.isFinite(updatedAt) && updatedAt < cutoff) {
+      jobs.delete(id);
+    }
+  }
+}
+
+function serializeJob(job, includeResult) {
+  return {
+    id: job.id,
+    kind: job.kind,
+    status: job.status,
+    input_summary: job.input_summary,
+    started_at: job.started_at,
+    updated_at: job.updated_at,
+    result: includeResult && job.status === "completed" ? job.result : undefined,
+    error: job.status === "failed" ? job.error : undefined
+  };
+}
+
+function summarizeFilesDigestArgs(args) {
+  return {
+    paths: args.paths,
+    cwd: args.cwd ?? process.cwd(),
+    task: args.task,
+    focus: args.focus,
+    max_total_bytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
+    max_file_bytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES,
+    enable_thinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING,
+    max_tokens: args.max_tokens ?? 3072
+  };
+}
+
 async function guardedQwenCall(fn) {
   const status = await getStatus();
   if (!status.online) {
@@ -345,6 +498,27 @@ async function chatCompletion({
   });
 }
 
+async function qwenFilesDigestText(args) {
+  const bundle = await readPathBundle(args.paths, {
+    cwd: args.cwd,
+    maxTotalBytes: args.max_total_bytes ?? DEFAULT_MAX_TOTAL_BYTES,
+    maxFileBytes: args.max_file_bytes ?? DEFAULT_MAX_FILE_BYTES
+  });
+
+  const prompt = digestPrompt(
+    args.task,
+    args.focus,
+    `${bundle.summary}\n\n${bundle.content}`
+  );
+  const completion = await chatCompletion({
+    messages: buildMessages(digestSystemPrompt(), prompt),
+    maxTokens: args.max_tokens ?? 3072,
+    temperature: 0.1,
+    enableThinking: args.enable_thinking ?? DEFAULT_ENABLE_THINKING
+  });
+  return extractMessageText(completion, false);
+}
+
 async function requestJson(endpoint, { method, body, timeoutMs }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -386,7 +560,7 @@ function extractMessageText(completion, includeReasoning) {
     return `${content}${usage}`;
   }
   if (reasoning) {
-    return `(Qwen returned reasoning_content but no final content. Try again with more max_tokens or enable_thinking=false.)\n\n${reasoning.slice(0, 4000)}${usage}`;
+    return `(Qwen returned hidden reasoning but no final content before the token budget ended. Retry with larger max_tokens, a higher QWEN_THINKING_MIN_MAX_TOKENS, a narrower task, or enable_thinking=false for that call.)${usage}`;
   }
   return `(empty Qwen response)${usage}`;
 }

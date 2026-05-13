@@ -25,6 +25,8 @@ POST /v1/chat/completions
 
 Every Qwen tool first checks whether the local server is reachable. If Qwen is offline, the tool returns a clear MCP error instead of blocking the Codex task.
 
+Some MCP clients time out a single tool call after roughly 120 seconds. For slow large-context digests, use the async job workflow: start `qwen_files_digest_async`, poll `qwen_job_status`, then fetch the completed text with `qwen_job_result`.
+
 Qwen thinking is enabled by default. The bridge sends:
 
 ```json
@@ -36,6 +38,8 @@ Qwen thinking is enabled by default. The bridge sends:
 ```
 
 When Qwen returns hidden reasoning as `reasoning_content`, the MCP bridge strips it from the normal tool response and returns only the final `content`. This preserves Qwen's reasoning quality without filling Codex's context with the hidden chain of thought. Thinking still costs local generation time and completion tokens, so the bridge gives thinking-enabled calls a larger token budget.
+
+If Qwen spends the whole completion budget thinking and never emits final `content`, the bridge returns a short diagnostic instead of exposing hidden reasoning. Increase `max_tokens`, raise `QWEN_THINKING_MIN_MAX_TOKENS`, narrow the task, or disable thinking for that specific call.
 
 ## Tools
 
@@ -56,6 +60,20 @@ Prefer `qwen_files_digest` when the content already exists in files.
 ### `qwen_files_digest`
 
 Reads local files or globs inside the MCP process and asks Qwen to summarize them for a specific task. This is the main context-offload tool because Codex can pass paths instead of loading huge files into its own context first.
+
+Use this only for small or narrowed digests that should finish inside the MCP client's tool-call timeout.
+
+### `qwen_files_digest_async`
+
+Starts a file/glob digest as a background job and returns a `job_id` immediately. Use this for real-world repository scans, long logs, or thinking-enabled digests that may take more than 120 seconds.
+
+### `qwen_job_status`
+
+Polls a background job and reports whether it is `running`, `completed`, or `failed`.
+
+### `qwen_job_result`
+
+Fetches the final text from a completed background job. Pass `clear: true` when the result is no longer needed.
 
 ### `qwen_code_review`
 
@@ -146,6 +164,18 @@ Restart or reload Codex after changing MCP config.
 | `QWEN_MAX_TOTAL_BYTES` | `1200000` | Default max total bytes read by file digest calls. |
 | `QWEN_MAX_FILE_BYTES` | `240000` | Default max bytes per file read by file digest calls. |
 | `QWEN_HARD_MAX_TOTAL_BYTES` | `8000000` | Hard cap for file digest input size. |
+| `QWEN_JOB_TTL_MS` | `3600000` | How long completed/failed background jobs stay in memory. |
+
+## Async Digest Workflow
+
+For large jobs, avoid holding a single MCP call open:
+
+1. Call `qwen_files_digest_async`.
+2. Keep the returned `job_id`.
+3. Poll `qwen_job_status` every 20-60 seconds.
+4. When the job is `completed`, call `qwen_job_result`.
+
+Background jobs live in the MCP server process memory. They are lost if Codex restarts the MCP server.
 
 ## Suggested Codex Usage Policy
 
@@ -154,7 +184,7 @@ Add this to your personal Codex instructions if you want Codex to proactively us
 ```markdown
 When a coding or agentic task has broad context, many files, long logs, draft-code generation, or a useful second-review pass, check the `qwen-local` MCP server with `qwen_status`. Use it when online; skip it without blocking when offline.
 
-Prefer `qwen_files_digest` for large file sets so Codex does not need to load all file contents into its own context. Use `qwen_chat`, `qwen_code_review`, and `qwen_refine_code` for secondary planning, independent review, and Qwen-to-Codex-to-Qwen refinement. Treat Qwen output as advisory and verify important claims in source files before editing or reporting.
+Prefer `qwen_files_digest_async` for large file sets so Codex does not need to load all file contents into its own context or hold a single MCP call open past the client timeout. Use synchronous `qwen_files_digest` only for small narrowed inputs. Use `qwen_chat`, `qwen_code_review`, and `qwen_refine_code` for secondary planning, independent review, and Qwen-to-Codex-to-Qwen refinement. Treat Qwen output as advisory and verify important claims in source files before editing or reporting.
 ```
 
 ## Development
